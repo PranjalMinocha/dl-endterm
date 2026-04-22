@@ -1,6 +1,4 @@
 import json
-import random
-import numpy as np
 import pandas as pd
 from PIL import Image
 from tqdm.auto import tqdm
@@ -146,6 +144,8 @@ model.eval()
 
 cnt_regex_failures = 0
 
+debug_data = []
+
 # Inference Loop
 for batch in tqdm(test_loader, desc="Running Inference"):
     # Prepare inputs
@@ -186,7 +186,17 @@ for batch in tqdm(test_loader, desc="Running Inference"):
         # Update the specific row in our submission dataframe
         if q_id in submission_df.index:
             submission_df.loc[q_id, "answer"] = pred_index
+        
+        debug_data.append({
+            "id": q_id,
+            "predicted_index": pred_index,
+            "raw_output": full_text # Saving just the generated part makes it easier to read!
+        })
 
 # Save the final file
 submission_df.to_csv("submission.csv")
 print("Inference complete. Saved to submission.csv. Total regex failures: ", cnt_regex_failures)
+
+debug_df = pd.DataFrame(debug_data)
+debug_df.to_csv("model_responses.csv", index=False)
+print("Saved full raw model outputs to model_responses.csv for inspection.")
