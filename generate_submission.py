@@ -1,4 +1,5 @@
 import json
+import os
 import pandas as pd
 from PIL import Image
 from tqdm.auto import tqdm
@@ -7,9 +8,13 @@ import re
 import torch
 from torch.utils.data import Dataset, DataLoader
 from transformers import AutoProcessor, AutoModelForVision2Seq
+from peft import PeftModel
 
 # Basic Settings
-IMG_SIZE = 224
+IMG_SIZE = 336
+
+LORA_DIR = os.path.join("outputs", "lora")
+PROCESSOR_DIR = os.path.join("outputs", "processor")
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -17,8 +22,14 @@ if torch.cuda.is_available():
     print(f"GPU: {torch.cuda.get_device_name(0)}")
 
 # Load CSVs
-test_df  = pd.read_csv("test.csv")
-submission_df = pd.read_csv("sample_submission.csv", index_col="id")
+test_csv = "test.csv" if os.path.exists("test.csv") else os.path.join("given", "test.csv")
+submission_csv = (
+    "sample_submission.csv"
+    if os.path.exists("sample_submission.csv")
+    else os.path.join("given", "sample_submission.csv")
+)
+test_df = pd.read_csv(test_csv)
+submission_df = pd.read_csv(submission_csv, index_col="id")
 
 # The 'choices' column is a JSON string, so we parse it
 test_df["choices"] = test_df["choices"].apply(json.loads)
@@ -123,7 +134,8 @@ test_loader = DataLoader(
 MODEL_ID = "HuggingFaceTB/SmolVLM-500M-Instruct"
 
 # Load Model and Processor
-processor = AutoProcessor.from_pretrained(MODEL_ID)
+processor_path = PROCESSOR_DIR if os.path.exists(PROCESSOR_DIR) else MODEL_ID
+processor = AutoProcessor.from_pretrained(processor_path)
 if processor.tokenizer.pad_token is None:
     processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
@@ -137,7 +149,9 @@ model = AutoModelForVision2Seq.from_pretrained(
     dtype=dtype,
     device_map="auto" if torch.cuda.is_available() else None,
     low_cpu_mem_usage=True,
- )
+)
+if os.path.exists(LORA_DIR):
+    model = PeftModel.from_pretrained(model, LORA_DIR)
 if not torch.cuda.is_available():
     model.to(device)
 model.eval()
