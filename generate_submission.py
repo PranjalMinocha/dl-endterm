@@ -1,14 +1,14 @@
-import json
 import os
 import pandas as pd
-from PIL import Image
 from tqdm.auto import tqdm
 import re
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from transformers import AutoProcessor, AutoModelForVision2Seq
 from peft import PeftModel
+
+from utils import ScienceQADataset, CHOICE_LETTERS, parse_choices_column
 
 # Basic Settings
 IMG_SIZE = 336
@@ -32,81 +32,11 @@ test_df = pd.read_csv(test_csv)
 submission_df = pd.read_csv(submission_csv, index_col="id")
 
 # The 'choices' column is a JSON string, so we parse it
-test_df["choices"] = test_df["choices"].apply(json.loads)
+test_df = parse_choices_column(test_df)
 
 print(f"Test: {len(test_df)}, Submission: {len(submission_df)}")
 
-# Prompt Engineering
-CHOICE_LETTERS = "ABCDEFGHIJ"
-
-def build_prompt(row: pd.Series, include_answer: bool = False) -> str:
-    """
-    Builds the text prompt for the Vision Language Model.
-    The <image> token is required for the model to process the image.
-    """
-    context_parts = []
-    lecture = row.get("lecture", "")
-    hint    = row.get("hint", "")
-    if pd.notna(lecture) and str(lecture).strip():
-        context_parts.append(str(lecture).strip())
-    if pd.notna(hint) and str(hint).strip():
-        context_parts.append(str(hint).strip())
-    context_str = "\n".join(context_parts)
-
-    choices = row["choices"]
-    choices_str = "\n".join(
-        f"  {CHOICE_LETTERS[i]}. {c}" for i, c in enumerate(choices)
-    )
-
-    prompt = "<image>\n"
-    if context_str:
-        prompt += f"Context:\n{context_str}\n\n"
-    prompt += f"Question: {row['question']}\n"
-    prompt += f"Choices:\n{choices_str}\n"
-    prompt += "Answer:"
-
-    if include_answer:
-        answer_idx = int(row['answer'])
-        prompt += f" {CHOICE_LETTERS[answer_idx]}"
-
-    return prompt
-
-
-# PyTorch Dataset
-class ScienceQADataset(Dataset):
-    def __init__(self, df: pd.DataFrame, img_size: int = 224, is_train: bool = True):
-        self.df = df.reset_index(drop=True)
-        self.img_size = img_size
-        self.is_train = is_train
-
-    def __len__(self) -> int:
-        return len(self.df)
-
-    def _load_image(self, path: str) -> Image.Image:
-        img = Image.open(path).convert("RGB")
-        img = img.resize((self.img_size, self.img_size), Image.BICUBIC)
-        return img
-
-    def __getitem__(self, idx: int) -> dict:
-        row = self.df.iloc[idx]
-        img = self._load_image(row["image_path"])
-
-        if self.is_train:
-            return {
-                "id": row["id"],
-                "image": img,
-                "text": build_prompt(row, include_answer=True),
-                "answer": int(row["answer"]),
-            }
-        else:
-            return {
-                "id": row["id"],
-                "image": img,
-                "text": build_prompt(row, include_answer=False),
-                "answer": int(row["answer"]) if "answer" in row else -1,
-            }
-
-test_ds  = ScienceQADataset(test_df, img_size=IMG_SIZE, is_train=False)
+test_ds = ScienceQADataset(test_df, img_size=IMG_SIZE, is_train=False)
 
 print(f"Test dataset created: {len(test_ds)} rows")
 

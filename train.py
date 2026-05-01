@@ -1,13 +1,10 @@
-import json
 import os
 from dataclasses import dataclass
 from typing import List, Dict, Any, Optional
 
 import numpy as np
 import pandas as pd
-from PIL import Image
 import torch
-from torch.utils.data import Dataset
 from transformers import (
     AutoProcessor,
     AutoModelForVision2Seq,
@@ -16,10 +13,11 @@ from transformers import (
 )
 from peft import LoraConfig, get_peft_model
 
+from utils import ScienceQADataset, build_prompt, CHOICE_LETTERS, parse_choices_column
+
 
 MODEL_ID = "HuggingFaceTB/SmolVLM-500M-Instruct"
 IMG_SIZE = 336
-CHOICE_LETTERS = "ABCDEFGHIJ"
 
 TRAIN_CSV = os.path.join("given", "train.csv")
 VAL_CSV = os.path.join("given", "val.csv")
@@ -34,49 +32,7 @@ def set_seed(seed: int) -> None:
     torch.cuda.manual_seed_all(seed)
 
 
-def build_prompt(row: pd.Series, include_answer: bool = False) -> str:
-    context_parts: List[str] = []
-    lecture = row.get("lecture", "")
-    hint = row.get("hint", "")
-    if pd.notna(lecture) and str(lecture).strip():
-        context_parts.append(str(lecture).strip())
-    if pd.notna(hint) and str(hint).strip():
-        context_parts.append(str(hint).strip())
-    context_str = "\n".join(context_parts)
-
-    choices = row["choices"]
-    choices_str = "\n".join(
-        f"  {CHOICE_LETTERS[i]}. {c}" for i, c in enumerate(choices)
-    )
-
-    prompt = "<image>\n"
-    if context_str:
-        prompt += f"Context:\n{context_str}\n\n"
-    prompt += f"Question: {row['question']}\n"
-    prompt += f"Choices:\n{choices_str}\n"
-    prompt += "Answer:"
-
-    if include_answer:
-        answer_idx = int(row["answer"])
-        prompt += f" {CHOICE_LETTERS[answer_idx]}"
-
-    return prompt
-
-
-class ScienceQADataset(Dataset):
-    def __init__(self, df: pd.DataFrame, img_size: int, is_train: bool = True):
-        self.df = df.reset_index(drop=True)
-        self.img_size = img_size
-        self.is_train = is_train
-
-    def __len__(self) -> int:
-        return len(self.df)
-
-    def _load_image(self, path: str) -> Image.Image:
-        img = Image.open(path).convert("RGB")
-        img = img.resize((self.img_size, self.img_size), Image.BICUBIC)
-        return img
-
+class ScienceQATrainDataset(ScienceQADataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         row = self.df.iloc[idx]
         img = self._load_image(row["image_path"])
@@ -163,8 +119,8 @@ if __name__ == "__main__":
     train_df = pd.read_csv(TRAIN_CSV)
     val_df = pd.read_csv(VAL_CSV)
 
-    train_df["choices"] = train_df["choices"].apply(json.loads)
-    val_df["choices"] = val_df["choices"].apply(json.loads)
+    train_df = parse_choices_column(train_df)
+    val_df = parse_choices_column(val_df)
 
     print(f"Train: {len(train_df)}, Val: {len(val_df)}")
 
@@ -192,8 +148,8 @@ if __name__ == "__main__":
     )
     model = get_peft_model(model, lora_config)
 
-    train_ds = ScienceQADataset(train_df, img_size=IMG_SIZE, is_train=True)
-    val_ds = ScienceQADataset(val_df, img_size=IMG_SIZE, is_train=False)
+    train_ds = ScienceQATrainDataset(train_df, img_size=IMG_SIZE, is_train=True)
+    val_ds = ScienceQATrainDataset(val_df, img_size=IMG_SIZE, is_train=False)
 
     data_collator = DataCollatorForSmolVLM(processor=processor)
 
