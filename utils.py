@@ -59,7 +59,7 @@ class ScienceQADataset(Dataset):
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         row = self.df.iloc[idx]
-        img = self._load_image(row["image_path"])
+        img = self._load_image("images/" + row["image_path"])
 
         if self.is_train:
             return {

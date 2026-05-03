@@ -5,7 +5,7 @@ import re
 
 import torch
 from torch.utils.data import DataLoader
-from transformers import AutoProcessor, AutoModelForVision2Seq
+from transformers import AutoProcessor, AutoModelForImageTextToText
 from peft import PeftModel
 
 from utils import ScienceQADataset, CHOICE_LETTERS, parse_choices_column
@@ -13,8 +13,7 @@ from utils import ScienceQADataset, CHOICE_LETTERS, parse_choices_column
 # Basic Settings
 IMG_SIZE = 336
 
-LORA_DIR = os.path.join("outputs", "lora")
-PROCESSOR_DIR = os.path.join("outputs", "processor")
+LORA_DIR = "outputs/checkpoint-1950" 
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -31,7 +30,7 @@ submission_csv = (
 test_df = pd.read_csv(test_csv)
 submission_df = pd.read_csv(submission_csv, index_col="id")
 
-# The 'choices' column is a JSON string, so we parse it
+# Parse JSON strings
 test_df = parse_choices_column(test_df)
 
 print(f"Test: {len(test_df)}, Submission: {len(submission_df)}")
@@ -41,21 +40,21 @@ test_ds = ScienceQADataset(test_df, img_size=IMG_SIZE, is_train=False)
 print(f"Test dataset created: {len(test_ds)} rows")
 
 # Define hyperparameters
-BATCH_SIZE = 8
-NUM_WORKERS = 4  # Adjust based on your CPU cores
+BATCH_SIZE = 32 
+NUM_WORKERS = 4 
 
 def custom_collate_fn(batch):
     return {
         "id": [item["id"] for item in batch],
-        "image": [item["image"] for item in batch], # Keeps these as a list of PIL Images
+        "image": [item["image"] for item in batch], 
         "text": [item["text"] for item in batch],
         "answer": [item["answer"] for item in batch]
     }
 
 test_loader = DataLoader(
-    test_ds, 
-    batch_size=BATCH_SIZE, 
-    shuffle=False, 
+    test_ds,
+    batch_size=BATCH_SIZE,
+    shuffle=False,
     num_workers=NUM_WORKERS,
     collate_fn=custom_collate_fn
 )
@@ -63,31 +62,43 @@ test_loader = DataLoader(
 # Model
 MODEL_ID = "HuggingFaceTB/SmolVLM-500M-Instruct"
 
-# Load Model and Processor
-processor_path = PROCESSOR_DIR if os.path.exists(PROCESSOR_DIR) else MODEL_ID
-processor = AutoProcessor.from_pretrained(processor_path)
+# Load Processor directly from Hugging Face
+processor = AutoProcessor.from_pretrained(MODEL_ID)
+
 if processor.tokenizer.pad_token is None:
     processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
-processor.tokenizer.padding_side = "left"
+# Left-padding is required for batched generation
+processor.tokenizer.padding_side = "left" 
 
 print(f'EOS token: {processor.tokenizer.eos_token}, Pad token: {processor.tokenizer.pad_token}')
 
-dtype = torch.float16 if torch.cuda.is_available() else torch.float32
-model = AutoModelForVision2Seq.from_pretrained(
+# Load Base Model
+dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32 
+model = AutoModelForImageTextToText.from_pretrained(
     MODEL_ID,
     dtype=dtype,
     device_map="auto" if torch.cuda.is_available() else None,
     low_cpu_mem_usage=True,
+    attn_implementation="flash_attention_2" if torch.cuda.is_available() else "sdpa", 
 )
+
+# Load and Merge LoRA Adapters
 if os.path.exists(LORA_DIR):
+    print(f"\nFound LoRA adapters at: {LORA_DIR}")
     model = PeftModel.from_pretrained(model, LORA_DIR)
+    
+    print("Merging LoRA weights into base model for fast inference...")
+    model = model.merge_and_unload() 
+else:
+    print(f"\nERROR: Could not find {LORA_DIR}. Check your folder path!")
+
 if not torch.cuda.is_available():
     model.to(device)
+
 model.eval()
 
 cnt_regex_failures = 0
-
 debug_data = []
 
 # Inference Loop
@@ -104,37 +115,37 @@ for batch in tqdm(test_loader, desc="Running Inference"):
     with torch.inference_mode():
         generated_ids = model.generate(
             **inputs,
-            max_new_tokens=50,
+            max_new_tokens=5, 
             do_sample=False,
         )
 
-    # Decode 
-    decoded_outputs = processor.batch_decode(generated_ids, skip_special_tokens=True)
-    
-    # Parse and Store in submission_df
+    # Decode only the newly generated tokens
+    prompt_length = inputs["input_ids"].shape[1]
+    new_tokens = generated_ids[:, prompt_length:]
+    decoded_outputs = processor.batch_decode(new_tokens, skip_special_tokens=True)
+
+    # Parse and Store
     for i in range(len(decoded_outputs)):
         q_id = batch["id"][i]
-        full_text = decoded_outputs[i]
-        
-        # Parse the output: Look for the first letter A-J after "Answer:"
-        match = re.search(r"Answer:\s*([A-J])", full_text)
-        
+        generated_text = decoded_outputs[i].strip()
+
+        # Check if the generated text starts with one of our letters
+        match = re.search(r"^([A-J])", generated_text)
+
         if match:
             pred_letter = match.group(1)
             pred_index = CHOICE_LETTERS.index(pred_letter)
         else:
-            # Fallback in case the model outputs something unexpected
             cnt_regex_failures += 1
-            pred_index = 0 
-            
-        # Update the specific row in our submission dataframe
+            pred_index = 0 # Fallback
+
         if q_id in submission_df.index:
             submission_df.loc[q_id, "answer"] = pred_index
-        
+
         debug_data.append({
             "id": q_id,
             "predicted_index": pred_index,
-            "raw_output": full_text # Saving just the generated part makes it easier to read!
+            "raw_output": generated_text
         })
 
 # Save the final file

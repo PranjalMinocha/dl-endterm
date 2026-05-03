@@ -7,11 +7,12 @@ import pandas as pd
 import torch
 from transformers import (
     AutoProcessor,
-    AutoModelForVision2Seq,
+    AutoModelForImageTextToText,
     TrainingArguments,
     Trainer,
 )
 from peft import LoraConfig, get_peft_model
+import re
 
 from utils import ScienceQADataset, build_prompt, CHOICE_LETTERS, parse_choices_column
 
@@ -35,7 +36,7 @@ def set_seed(seed: int) -> None:
 class ScienceQATrainDataset(ScienceQADataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         row = self.df.iloc[idx]
-        img = self._load_image(row["image_path"])
+        img = self._load_image("images/" + row["image_path"])
         prompt = build_prompt(row, include_answer=False)
         label_text = f" {CHOICE_LETTERS[int(row['answer'])]}"
         return {
@@ -53,46 +54,71 @@ class DataCollatorForSmolVLM:
 
     def __call__(self, features: List[Dict[str, Any]]) -> Dict[str, Any]:
         images = [f["image"] for f in features]
-        prompts = [f["prompt"] for f in features]
-        label_texts = [f["label_text"] for f in features]
+        # Combine prompt and label into one string for the causal decoder
+        full_texts = [f["prompt"] + f["label_text"] for f in features]
+        prompt_texts = [f["prompt"] for f in features]
 
-        prompt_inputs = self.processor(
-            text=prompts,
+        # Tokenize the full sequence (Prompt + Answer)
+        batch = self.processor(
+            text=full_texts,
             images=images,
             padding=True,
             return_tensors="pt",
         )
 
-        with self.processor.as_target_processor():
-            labels = self.processor.tokenizer(
-                label_texts,
-                padding=True,
-                return_tensors="pt",
-            )["input_ids"]
-
-        labels = labels.masked_fill(
-            labels == self.processor.tokenizer.pad_token_id,
-            self.label_pad_token_id,
+        # Tokenize the prompt alone to find where the "Answer" starts
+        prompt_encodings = self.processor.tokenizer(
+            prompt_texts,
+            padding=True,
+            return_tensors="pt",
+            add_special_tokens=False
         )
 
-        prompt_inputs["labels"] = labels
-        return prompt_inputs
+        # Create labels by copying input_ids
+        labels = batch["input_ids"].clone()
+
+        # Mask the prompt tokens: Find the length of each prompt and set labels to -100
+        for i in range(len(features)):
+            # Find how many tokens were padding in the prompt (if left padded)
+            prompt_len = prompt_encodings["attention_mask"][i].sum().item()
+
+            # Mask the prompt part (0 to prompt_len)
+            labels[i, :prompt_len] = self.label_pad_token_id
+
+        # Mask the padding tokens in the labels
+        labels[labels == self.processor.tokenizer.pad_token_id] = self.label_pad_token_id
+
+        batch["labels"] = labels
+        return batch
 
 
 def parse_pred_letter(text: str) -> Optional[str]:
-    for ch in text:
-        if ch in CHOICE_LETTERS:
-            return ch
+    # This specifically looks for the A-J letter right after "Answer:"
+    match = re.search(r"Answer:\s*([A-J])", text)
+    if match:
+        return match.group(1)
     return None
 
 
-def compute_metrics(eval_pred):
-    preds, labels = eval_pred
-    if isinstance(preds, tuple):
-        preds = preds[0]
+def preprocess_logits_for_metrics(logits, labels):
+    """
+    Shrinks the massive logits tensor into just the predicted token IDs
+    batch-by-batch so the GPU memory doesn't explode during validation.
+    """
+    if isinstance(logits, tuple):
+        logits = logits[0]
+    # Do the argmax here, before the batches are gathered!
+    return logits.argmax(dim=-1)
 
-    pred_ids = np.argmax(preds, axis=-1)
+
+def compute_metrics(eval_pred):
+    pred_ids, labels = eval_pred
+    if isinstance(pred_ids, tuple):
+        pred_ids = pred_ids[0]
+
+    pred_ids = np.where(pred_ids != -100, pred_ids, processor.tokenizer.pad_token_id)
     pred_texts = processor.tokenizer.batch_decode(pred_ids, skip_special_tokens=True)
+
     label_ids = np.where(labels != -100, labels, processor.tokenizer.pad_token_id)
     label_texts = processor.tokenizer.batch_decode(label_ids, skip_special_tokens=True)
 
@@ -127,16 +153,19 @@ if __name__ == "__main__":
     processor = AutoProcessor.from_pretrained(MODEL_ID)
     if processor.tokenizer.pad_token is None:
         processor.tokenizer.pad_token = processor.tokenizer.eos_token
-    processor.tokenizer.padding_side = "left"
+    processor.tokenizer.padding_side = "right"
 
     dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
-    model = AutoModelForVision2Seq.from_pretrained(
+    model = AutoModelForImageTextToText.from_pretrained(
         MODEL_ID,
-        torch_dtype=dtype,
+        dtype=dtype,
         device_map="auto" if torch.cuda.is_available() else None,
         low_cpu_mem_usage=True,
         attn_implementation="flash_attention_2" if torch.cuda.is_available() else "sdpa",
+        use_cache=False,
     )
+    if hasattr(model, "generation_config"):
+        model.generation_config.use_cache = False
 
     lora_config = LoraConfig(
         r=16,
@@ -144,9 +173,11 @@ if __name__ == "__main__":
         lora_dropout=0.05,
         bias="none",
         target_modules=["q_proj", "k_proj", "v_proj", "o_proj"],
-        task_type="SEQ_2_SEQ_LM",
+        task_type="CAUSAL_LM",
     )
     model = get_peft_model(model, lora_config)
+
+    model.print_trainable_parameters()
 
     train_ds = ScienceQATrainDataset(train_df, img_size=IMG_SIZE, is_train=True)
     val_ds = ScienceQATrainDataset(val_df, img_size=IMG_SIZE, is_train=False)
@@ -155,17 +186,21 @@ if __name__ == "__main__":
 
     args = TrainingArguments(
         output_dir=OUTPUT_DIR,
-        per_device_train_batch_size=2,
-        per_device_eval_batch_size=2,
-        gradient_accumulation_steps=8,
+        per_device_train_batch_size=4,
+        per_device_eval_batch_size=32,
+        gradient_accumulation_steps=4,
+        eval_accumulation_steps=50,
+        dataloader_num_workers=4,
+        dataloader_pin_memory=True,
         learning_rate=2e-4,
-        num_train_epochs=4,
-        warmup_ratio=0.03,
-        bf16=torch.cuda.is_available(),
+        num_train_epochs=10,
+        warmup_steps=0.03,
+        bf16=True,
+        tf32=True,
         logging_steps=25,
-        evaluation_strategy="steps",
-        eval_steps=200,
-        save_steps=200,
+        eval_strategy="steps",
+        eval_steps=50,
+        save_steps=50,
         save_total_limit=2,
         load_best_model_at_end=True,
         metric_for_best_model="accuracy",
@@ -181,10 +216,11 @@ if __name__ == "__main__":
         eval_dataset=val_ds,
         data_collator=data_collator,
         compute_metrics=compute_metrics,
+        preprocess_logits_for_metrics=preprocess_logits_for_metrics,
     )
 
     print("Starting training...")
-    trainer.train()
+    trainer.train(ignore_keys_for_eval=["past_key_values"])
 
     print("Saving LoRA adapters...")
     model.save_pretrained(os.path.join(OUTPUT_DIR, "lora"))
