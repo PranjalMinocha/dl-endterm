@@ -118,6 +118,7 @@ for batch in tqdm(test_loader, desc="Running Inference"):
             max_new_tokens=500,
             do_sample=False,
             use_cache=True,
+            repetition_penalty=1.15
         )
 
     # Decode only the newly generated tokens
