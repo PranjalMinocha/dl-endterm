@@ -29,11 +29,7 @@ def build_prompt(row: pd.Series, include_answer: bool = False) -> str:
         prompt += f"Context:\n{context_str}\n\n"
     prompt += f"Question: {row['question']}\n"
     prompt += f"Choices:\n{choices_str}\n"
-    prompt += "Answer:"
-
-    if include_answer:
-        answer_idx = int(row["answer"])
-        prompt += f" {CHOICE_LETTERS[answer_idx]}"
+    prompt += "Solution:\n"
 
     return prompt
 
@@ -61,16 +57,9 @@ class ScienceQADataset(Dataset):
         row = self.df.iloc[idx]
         img = self._load_image("images/" + row["image_path"])
 
-        if self.is_train:
-            return {
-                "id": row["id"],
-                "image": img,
-                "text": build_prompt(row, include_answer=True),
-                "answer": int(row["answer"]),
-            }
         return {
             "id": row["id"],
             "image": img,
-            "text": build_prompt(row, include_answer=False),
+            "text": build_prompt(row),
             "answer": int(row["answer"]) if "answer" in row else -1,
         }

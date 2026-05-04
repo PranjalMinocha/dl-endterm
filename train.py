@@ -37,8 +37,19 @@ class ScienceQATrainDataset(ScienceQADataset):
     def __getitem__(self, idx: int) -> Dict[str, Any]:
         row = self.df.iloc[idx]
         img = self._load_image("images/" + row["image_path"])
-        prompt = build_prompt(row, include_answer=False)
-        label_text = f" {CHOICE_LETTERS[int(row['answer'])]}"
+
+        prompt = build_prompt(row)
+
+        answer_letter = CHOICE_LETTERS[int(row['answer'])]
+        solution = str(row.get("solution", "")).strip()
+
+        if pd.notna(row.get("solution")) and solution and solution.lower() != "nan":
+            # If there is a solution, make the model write it out first
+            label_text = f"{solution} Hence, correct choice is {answer_letter}."
+        else:
+            # Fallback if a row is missing a solution
+            label_text = f"Correct choice is {answer_letter}."
+
         return {
             "id": row["id"],
             "image": img,
@@ -93,10 +104,15 @@ class DataCollatorForSmolVLM:
 
 
 def parse_pred_letter(text: str) -> Optional[str]:
-    # This specifically looks for the A-J letter right after "Answer:"
-    match = re.search(r"Answer:\s*([A-J])", text)
+    match = re.search(r"choice is ([A-J])", text, re.IGNORECASE)
     if match:
-        return match.group(1)
+        return match.group(1).upper()
+
+    # Fallback: If model rambled, just find the very last standalone A-J letter in the whole text
+    matches = re.findall(r"\b([A-J])\b", text)
+    if matches:
+        return matches[-1].upper()
+
     return None
 
 
@@ -186,21 +202,21 @@ if __name__ == "__main__":
 
     args = TrainingArguments(
         output_dir=OUTPUT_DIR,
-        per_device_train_batch_size=4,
+        per_device_train_batch_size=2,
         per_device_eval_batch_size=32,
         gradient_accumulation_steps=4,
-        eval_accumulation_steps=50,
+        eval_accumulation_steps=100,
         dataloader_num_workers=4,
         dataloader_pin_memory=True,
-        learning_rate=2e-4,
-        num_train_epochs=10,
+        learning_rate=1e-4,
+        num_train_epochs=7,
         warmup_steps=0.03,
         bf16=True,
         tf32=True,
         logging_steps=25,
         eval_strategy="steps",
-        eval_steps=50,
-        save_steps=50,
+        eval_steps=100,
+        save_steps=100,
         save_total_limit=2,
         load_best_model_at_end=True,
         metric_for_best_model="accuracy",

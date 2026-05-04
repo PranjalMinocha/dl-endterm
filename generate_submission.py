@@ -13,7 +13,7 @@ from utils import ScienceQADataset, CHOICE_LETTERS, parse_choices_column
 # Basic Settings
 IMG_SIZE = 336
 
-LORA_DIR = "outputs/checkpoint-1950" 
+LORA_DIR = "outputs/checkpoint-2723"
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Using device: {device}")
@@ -35,12 +35,12 @@ test_df = parse_choices_column(test_df)
 
 print(f"Test: {len(test_df)}, Submission: {len(submission_df)}")
 
-test_ds = ScienceQADataset(test_df, img_size=IMG_SIZE, is_train=False)
+test_ds = ScienceQADataset(test_df, img_size=IMG_SIZE)
 
 print(f"Test dataset created: {len(test_ds)} rows")
 
 # Define hyperparameters
-BATCH_SIZE = 32 
+BATCH_SIZE = 64 
 NUM_WORKERS = 4 
 
 def custom_collate_fn(batch):
@@ -62,34 +62,34 @@ test_loader = DataLoader(
 # Model
 MODEL_ID = "HuggingFaceTB/SmolVLM-500M-Instruct"
 
-# Load Processor directly from Hugging Face
+# Load Processor directly from Hugging Face (safest method for inference)
 processor = AutoProcessor.from_pretrained(MODEL_ID)
 
 if processor.tokenizer.pad_token is None:
     processor.tokenizer.pad_token = processor.tokenizer.eos_token
 
 # Left-padding is required for batched generation
-processor.tokenizer.padding_side = "left" 
+processor.tokenizer.padding_side = "left"
 
 print(f'EOS token: {processor.tokenizer.eos_token}, Pad token: {processor.tokenizer.pad_token}')
 
 # Load Base Model
-dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32 
+dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
 model = AutoModelForImageTextToText.from_pretrained(
     MODEL_ID,
-    dtype=dtype,
+    dtype=dtype, # FIX 2: Corrected from dtype=dtype
     device_map="auto" if torch.cuda.is_available() else None,
     low_cpu_mem_usage=True,
-    attn_implementation="flash_attention_2" if torch.cuda.is_available() else "sdpa", 
+    attn_implementation="flash_attention_2" if torch.cuda.is_available() else "sdpa",
 )
 
 # Load and Merge LoRA Adapters
 if os.path.exists(LORA_DIR):
     print(f"\nFound LoRA adapters at: {LORA_DIR}")
     model = PeftModel.from_pretrained(model, LORA_DIR)
-    
+
     print("Merging LoRA weights into base model for fast inference...")
-    model = model.merge_and_unload() 
+    model = model.merge_and_unload()
 else:
     print(f"\nERROR: Could not find {LORA_DIR}. Check your folder path!")
 
@@ -115,8 +115,9 @@ for batch in tqdm(test_loader, desc="Running Inference"):
     with torch.inference_mode():
         generated_ids = model.generate(
             **inputs,
-            max_new_tokens=5, 
+            max_new_tokens=500,
             do_sample=False,
+            use_cache=True,
         )
 
     # Decode only the newly generated tokens
@@ -129,15 +130,22 @@ for batch in tqdm(test_loader, desc="Running Inference"):
         q_id = batch["id"][i]
         generated_text = decoded_outputs[i].strip()
 
-        # Check if the generated text starts with one of our letters
-        match = re.search(r"^([A-J])", generated_text)
+        # Try to find the exact phrase it was trained on
+        match = re.search(r"choice is ([A-J])", generated_text, re.IGNORECASE)
 
         if match:
-            pred_letter = match.group(1)
+            pred_letter = match.group(1).upper()
             pred_index = CHOICE_LETTERS.index(pred_letter)
         else:
-            cnt_regex_failures += 1
-            pred_index = 0 # Fallback
+            # Fallback: find the very last A-J letter in the ramble
+            matches = re.findall(r"\b([A-J])\b", generated_text)
+            if matches:
+                pred_letter = matches[-1].upper()
+                pred_index = CHOICE_LETTERS.index(pred_letter)
+            else:
+                # Absolute failure fallback
+                cnt_regex_failures += 1
+                pred_index = 0
 
         if q_id in submission_df.index:
             submission_df.loc[q_id, "answer"] = pred_index
